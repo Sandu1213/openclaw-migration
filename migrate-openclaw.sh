@@ -3,47 +3,49 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ARCHIVE_DEFAULT="${SCRIPT_DIR}/openclaw-migrate-$(date +%F-%H%M%S).tar.gz"
+ARCHIVE_DEFAULT="${SCRIPT_DIR}/openclaw-backup-$(date +%F-%H%M%S).tar.gz"
 OPENCLAW_DIR_DEFAULT="${HOME}/.openclaw"
 
 usage() {
   cat <<'EOF'
-OpenClaw Migration Helper (enhanced)
+OpenClaw Migration Helper v2
 
-Default behavior now prefers the official OpenClaw backup flow for archive creation
-and keeps this script focused on import + migration verification.
+Philosophy:
+- Export/verify rely on the official OpenClaw backup flow.
+- This script focuses on restore orchestration + migration validation.
+- No repacking, no custom archive layout assumptions.
 
 Usage:
   migrate-openclaw.sh export [archive_path] [options]
   migrate-openclaw.sh import <archive_path> [--overwrite]
-  migrate-openclaw.sh verify
+  migrate-openclaw.sh verify [archive_path]
   migrate-openclaw.sh backup-verify <archive_path>
+  migrate-openclaw.sh snapshot-manifest [output_path]
 
 Commands:
-  export         Create backup archive. Defaults to official `openclaw backup create`.
-  import         Restore archive into ~/.openclaw.
-  verify         Run quick post-import / post-migration checks.
-  backup-verify  Run official `openclaw backup verify` on an archive.
+  export            Create backup archive via official `openclaw backup create`.
+  import            Restore archive payload into ~/.openclaw.
+  verify            Run migration checks; optionally also verify an archive first.
+  backup-verify     Run official `openclaw backup verify` on an archive.
+  snapshot-manifest Write a lightweight manifest of current local state.
 
 Export options:
-  --include-agents        Add agents/ into the exported archive (repack on top of official backup).
-  --legacy-export         Use the old custom packer instead of `openclaw backup create`.
   --no-include-workspace  Pass through to official backup create.
   --only-config           Pass through to official backup create.
   --skip-verify           Do not run official backup verification after export.
 
 Import options:
-  --overwrite             Move existing ~/.openclaw aside before import (rollback-friendly).
+  --overwrite             Move existing ~/.openclaw aside before import.
 
 Examples:
   ./migrate-openclaw.sh export
   ./migrate-openclaw.sh export ./backup.tar.gz --skip-verify
-  ./migrate-openclaw.sh export ./backup.tar.gz --include-agents
-  ./migrate-openclaw.sh export ./backup.tar.gz --legacy-export --include-agents
   ./migrate-openclaw.sh export ./backup.tar.gz --no-include-workspace
   ./migrate-openclaw.sh import ./backup.tar.gz --overwrite
   ./migrate-openclaw.sh verify
+  ./migrate-openclaw.sh verify ./backup.tar.gz
   ./migrate-openclaw.sh backup-verify ./backup.tar.gz
+  ./migrate-openclaw.sh snapshot-manifest
 EOF
 }
 
@@ -60,210 +62,81 @@ cleanup_dir() {
   [[ -n "$dir" && -d "$dir" ]] && rm -rf "$dir"
 }
 
-write_plugin_manifest() {
-  local root="$1"
-  local manifest="$root/.openclaw/plugin-manifest.txt"
-  : >"$manifest"
-
-  {
-    echo "# OpenClaw plugin manifest"
-    echo "generated_at=$(date -Iseconds)"
-    echo
-    echo "[plugins.entries from openclaw.json]"
-    if [[ -f "$root/.openclaw/openclaw.json" ]]; then
-      python3 - <<'PY' "$root/.openclaw/openclaw.json"
-import json,sys
-p=sys.argv[1]
-obj=json.load(open(p,'r',encoding='utf-8'))
-entries=((obj.get('plugins') or {}).get('entries') or {})
-if isinstance(entries, dict):
-    for k,v in entries.items():
-        enabled = v.get('enabled') if isinstance(v,dict) else v
-        print(f"{k}\tenabled={enabled}")
-else:
-    print("(unexpected plugins.entries format)")
-PY
-    else
-      echo "(missing openclaw.json)"
-    fi
-
-    echo
-    echo "[extensions directory]"
-    if [[ -d "$root/.openclaw/extensions" ]]; then
-      find "$root/.openclaw/extensions" -mindepth 1 -maxdepth 1 -type d | while read -r d; do
-        local id
-        id="$(basename "$d")"
-        local name=""
-        local version=""
-        if [[ -f "$d/package.json" ]]; then
-          name="$(python3 - <<'PY' "$d/package.json"
-import json,sys
-obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
-print(obj.get('name',''))
-PY
-)"
-          version="$(python3 - <<'PY' "$d/package.json"
-import json,sys
-obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
-print(obj.get('version',''))
-PY
-)"
-        fi
-        echo "$id\tpackage=$name\tversion=$version"
-      done
-    else
-      echo "(no extensions directory)"
-    fi
-  } >>"$manifest"
-
-  echo "[INFO] Wrote plugin manifest: $manifest"
-}
-
-legacy_export_openclaw() {
-  require_bin tar
-  local archive_path="${1:-$ARCHIVE_DEFAULT}"
-  local include_agents="${2:-false}"
-  local openclaw_dir="$OPENCLAW_DIR_DEFAULT"
-
-  if [[ ! -d "$openclaw_dir" ]]; then
-    echo "[ERROR] Directory not found: $openclaw_dir" >&2
-    exit 1
-  fi
-
-  echo "[INFO] Stopping gateway before legacy export..."
-  openclaw gateway stop >/dev/null 2>&1 || true
-
-  local tmp_root
-  tmp_root="$(mktemp -d)"
-  trap 'cleanup_dir "$tmp_root"' RETURN
-
-  mkdir -p "$tmp_root/.openclaw"
-
-  local include_paths=(
-    "openclaw.json"
-    "openclaw.json.bak"
-    "workspace"
-    "cron"
-    "extensions"
-    "memory"
-    "credentials"
-    "identity"
-    "devices"
-  )
-
-  if [[ "$include_agents" == "true" ]]; then
-    include_paths+=("agents")
-  fi
-
-  echo "[INFO] Collecting files for legacy export..."
-  for p in "${include_paths[@]}"; do
-    if [[ -e "$openclaw_dir/$p" ]]; then
-      cp -a "$openclaw_dir/$p" "$tmp_root/.openclaw/"
-    fi
-  done
-
-  write_plugin_manifest "$tmp_root"
-
-  mkdir -p "$(dirname "$archive_path")"
-  tar -czf "$archive_path" -C "$tmp_root" .openclaw
-
-  echo "[OK] Legacy export finished: $archive_path"
-  if [[ "$include_agents" != "true" ]]; then
-    echo "[INFO] agents/ was excluded. Use --include-agents if you need session history."
-  fi
-}
-
-parse_archive_path_from_output() {
+json_get_archive_path() {
   local output="$1"
   python3 - <<'PY' "$output"
-import json, re, sys
+import json, sys
 text = sys.argv[1]
-
-# Try JSON lines / plain JSON first.
 for line in reversed([ln for ln in text.splitlines() if ln.strip()]):
     try:
         obj = json.loads(line)
-        if isinstance(obj, dict):
-            for key in ("archive", "archivePath", "path", "output"):
-                value = obj.get(key)
-                if isinstance(value, str) and value.endswith('.tar.gz'):
-                    print(value)
-                    raise SystemExit(0)
     except Exception:
-        pass
-
-# Fallback for human-readable output.
-patterns = [
-    r'([~/][^\s]*openclaw-backup[^\s]*\.tar\.gz)',
-    r'((?:/|\./|\.\./)[^\s]*openclaw-backup[^\s]*\.tar\.gz)',
-    r'(openclaw-backup[^\s]*\.tar\.gz)'
-]
-for pattern in patterns:
-    matches = re.findall(pattern, text)
-    if matches:
-        print(matches[-1])
-        raise SystemExit(0)
+        continue
+    if isinstance(obj, dict):
+        value = obj.get('archivePath') or obj.get('archive') or obj.get('path')
+        if isinstance(value, str) and value.endswith('.tar.gz'):
+            print(value)
+            raise SystemExit(0)
 PY
 }
 
-resolve_generated_archive() {
+find_generated_archive() {
+  local output_dir="$1"
+  local candidates=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && candidates+=("$line")
+  done < <(find "$output_dir" -maxdepth 1 -type f -name '*openclaw-backup*.tar.gz' -print 2>/dev/null | sort)
+
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    printf '%s\n' "${candidates[0]}"
+    return 0
+  fi
+
+  if [[ "${#candidates[@]}" -gt 1 ]]; then
+    echo "[ERROR] Multiple backup archives found in $output_dir; refusing to guess." >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+    exit 1
+  fi
+
+  echo "[ERROR] Could not find generated backup archive in $output_dir" >&2
+  exit 1
+}
+
+resolve_archive_from_output() {
   local output="$1"
   local output_dir="$2"
   local parsed
-  parsed="$(parse_archive_path_from_output "$output" || true)"
+  parsed="$(json_get_archive_path "$output" || true)"
 
   if [[ -n "$parsed" ]]; then
     if [[ "$parsed" == ~/* ]]; then
       parsed="${HOME}/${parsed#~/}"
-    elif [[ "$parsed" != /* ]]; then
+    fi
+    if [[ "$parsed" != /* ]]; then
       parsed="${output_dir}/${parsed#./}"
+    fi
+    if [[ -f "$parsed" ]]; then
+      printf '%s\n' "$parsed"
+      return 0
     fi
   fi
 
-  if [[ -n "$parsed" && -f "$parsed" ]]; then
-    printf '%s\n' "$parsed"
-    return 0
-  fi
-
-  local recent_files=()
-  local recent_output
-  recent_output="$(find "$output_dir" -maxdepth 1 -type f -name '*openclaw-backup*.tar.gz' -mmin -5 -print 2>/dev/null | sort || true)"
-  if [[ -n "$recent_output" ]]; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && recent_files+=("$line")
-    done <<EOF
-$recent_output
-EOF
-  fi
-
-  if [[ "${#recent_files[@]}" -eq 1 ]]; then
-    printf '%s\n' "${recent_files[0]}"
-    return 0
-  fi
-
-  if [[ "${#recent_files[@]}" -gt 1 ]]; then
-    echo "[ERROR] Multiple candidate official backup archives found in $output_dir; refusing to guess." >&2
-    printf '  %s\n' "${recent_files[@]}" >&2
-    echo "[HINT] Use an empty output directory or rely on official output naming." >&2
-    exit 1
-  fi
-
-  echo "[ERROR] Could not locate generated official backup archive in $output_dir" >&2
-  exit 1
+  find_generated_archive "$output_dir"
 }
 
 create_official_backup() {
+  require_bin openclaw
+
   local archive_path="$1"
   local include_workspace="$2"
   local only_config="$3"
   local verify_after="$4"
-
-  require_bin openclaw
   local output_dir
   output_dir="$(dirname "$archive_path")"
   mkdir -p "$output_dir"
 
-  local cmd=(openclaw backup create --output "$output_dir")
+  local cmd=(openclaw backup create --output "$output_dir" --json)
   if [[ "$include_workspace" != "true" ]]; then
     cmd+=(--no-include-workspace)
   fi
@@ -282,7 +155,7 @@ create_official_backup() {
   printf '%s\n' "$cmd_output"
 
   local generated
-  generated="$(resolve_generated_archive "$cmd_output" "$output_dir")"
+  generated="$(resolve_archive_from_output "$cmd_output" "$output_dir")"
 
   if [[ "$generated" != "$archive_path" ]]; then
     if [[ -e "$archive_path" ]]; then
@@ -290,82 +163,21 @@ create_official_backup() {
       exit 1
     fi
     mv "$generated" "$archive_path"
-    echo "[INFO] Renamed official archive to: $archive_path"
-  fi
-
-  echo "[OK] Official backup archive ready: $archive_path"
-}
-
-append_agents_and_metadata() {
-  local archive_path="$1"
-  local include_agents="$2"
-  local openclaw_dir="$OPENCLAW_DIR_DEFAULT"
-
-  if [[ "$include_agents" != "true" ]]; then
-    return 0
-  fi
-
-  require_bin tar
-  if [[ ! -d "$openclaw_dir/agents" ]]; then
-    echo "[WARN] agents/ not found under $openclaw_dir, skipping agents append"
-    return 0
-  fi
-
-  echo "[INFO] Repacking archive to include agents/ and migration metadata..."
-
-  local tmp_extract repacked
-  tmp_extract="$(mktemp -d)"
-  repacked="${archive_path%.tar.gz}.repacked.tar.gz"
-  trap 'cleanup_dir "$tmp_extract"; [[ -f "$repacked" ]] && rm -f "$repacked"' RETURN
-
-  tar -xzf "$archive_path" -C "$tmp_extract"
-
-  local extracted_root
-  extracted_root="$(find "$tmp_extract" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
-  if [[ -z "$extracted_root" ]]; then
-    echo "[ERROR] Could not determine extracted archive root while appending agents" >&2
-    exit 1
-  fi
-
-  if [[ ! -d "$extracted_root/agents" ]]; then
-    cp -a "$openclaw_dir/agents" "$extracted_root/agents"
-  fi
-
-  write_plugin_manifest "$tmp_extract"
-
-  tar -czf "$repacked" -C "$tmp_extract" "$(basename "$extracted_root")"
-  mv "$repacked" "$archive_path"
-
-  echo "[OK] Added agents/ and plugin manifest to: $archive_path"
-}
-
-export_openclaw() {
-  local archive_path="${1:-$ARCHIVE_DEFAULT}"
-  local include_agents="${2:-false}"
-  local legacy_export="${3:-false}"
-  local include_workspace="${4:-true}"
-  local only_config="${5:-false}"
-  local verify_after="${6:-true}"
-
-  if [[ "$legacy_export" == "true" ]]; then
-    legacy_export_openclaw "$archive_path" "$include_agents"
-    return 0
-  fi
-
-  create_official_backup "$archive_path" "$include_workspace" "$only_config" "$verify_after"
-  append_agents_and_metadata "$archive_path" "$include_agents"
-
-  if [[ "$verify_after" == "true" ]]; then
-    echo "[INFO] Running final official backup verification after repack..."
-    openclaw backup verify "$archive_path"
+    echo "[INFO] Renamed archive to: $archive_path"
   fi
 
   echo "[OK] Export finished: $archive_path"
-  echo "[INFO] Default path now uses official OpenClaw backup create; this script adds migration-oriented extras on top."
 }
 
 find_import_root() {
   local extract_dir="$1"
+
+  local candidate
+  candidate="$(find "$extract_dir" -type d -path '*/payload/posix/*/.openclaw' | head -n 1 || true)"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
 
   if [[ -d "$extract_dir/.openclaw" ]]; then
     printf '%s\n' "$extract_dir/.openclaw"
@@ -377,7 +189,6 @@ find_import_root() {
     return 0
   fi
 
-  local candidate
   candidate="$(find "$extract_dir" -type d -name .openclaw | head -n 1 || true)"
   if [[ -n "$candidate" ]]; then
     printf '%s\n' "$candidate"
@@ -388,8 +199,68 @@ find_import_root() {
   exit 1
 }
 
+write_snapshot_manifest() {
+  local output_path="${1:-${SCRIPT_DIR}/openclaw-state-manifest-$(date +%F-%H%M%S).txt}"
+  local base="$OPENCLAW_DIR_DEFAULT"
+
+  mkdir -p "$(dirname "$output_path")"
+
+  {
+    echo "# OpenClaw state snapshot manifest"
+    echo "generated_at=$(date -Iseconds)"
+    echo "openclaw_dir=$base"
+    echo
+
+    echo "[version]"
+    openclaw --version 2>/dev/null || true
+    echo
+
+    echo "[top-level entries under ~/.openclaw]"
+    if [[ -d "$base" ]]; then
+      find "$base" -mindepth 1 -maxdepth 1 | sort
+    else
+      echo "(missing $base)"
+    fi
+    echo
+
+    echo "[plugins.entries from openclaw.json]"
+    if [[ -f "$base/openclaw.json" ]]; then
+      python3 - <<'PY' "$base/openclaw.json"
+import json,sys
+p=sys.argv[1]
+obj=json.load(open(p,'r',encoding='utf-8'))
+entries=((obj.get('plugins') or {}).get('entries') or {})
+if isinstance(entries, dict):
+    for k,v in entries.items():
+        enabled = v.get('enabled') if isinstance(v,dict) else v
+        print(f"{k}\tenabled={enabled}")
+else:
+    print('(unexpected plugins.entries format)')
+PY
+    else
+      echo "(missing openclaw.json)"
+    fi
+    echo
+
+    echo "[extensions directory]"
+    if [[ -d "$base/extensions" ]]; then
+      find "$base/extensions" -mindepth 1 -maxdepth 1 -type d | sort | while read -r d; do
+        local id
+        id="$(basename "$d")"
+        echo "$id"
+      done
+    else
+      echo "(no extensions directory)"
+    fi
+  } > "$output_path"
+
+  echo "[OK] Snapshot manifest written: $output_path"
+}
+
 import_openclaw() {
   require_bin tar
+  require_bin openclaw
+
   local archive_path="${1:-}"
   local overwrite="${2:-false}"
   local openclaw_dir="$OPENCLAW_DIR_DEFAULT"
@@ -404,6 +275,9 @@ import_openclaw() {
     echo "[ERROR] Archive not found: $archive_path" >&2
     exit 1
   fi
+
+  echo "[INFO] Verifying archive before import..."
+  openclaw backup verify "$archive_path"
 
   echo "[INFO] Stopping gateway before import..."
   openclaw gateway stop >/dev/null 2>&1 || true
@@ -438,27 +312,36 @@ import_openclaw() {
   openclaw gateway start >/dev/null 2>&1 || true
 
   echo "[OK] Import finished. Recommended next steps:"
-  echo "      $0 backup-verify $archive_path"
-  echo "      $0 verify"
+  echo "      $0 verify $archive_path"
   if [[ -n "$backup_dir" ]]; then
     echo "[INFO] Previous state kept at: $backup_dir"
     echo "[INFO] Delete it manually after validation if you no longer need rollback."
   fi
 }
 
-verify_plugins() {
+run_check() {
+  local title="$1"
+  shift
+  echo
+  echo "== $title =="
+  "$@" || true
+}
+
+verify_workspace() {
+  local ws="$OPENCLAW_DIR_DEFAULT/workspace"
+  echo
+  echo "== workspace checks =="
+  [[ -d "$OPENCLAW_DIR_DEFAULT" ]] && echo "[OK] ~/.openclaw exists" || echo "[WARN] ~/.openclaw missing"
+  [[ -f "$OPENCLAW_DIR_DEFAULT/openclaw.json" ]] && echo "[OK] openclaw.json exists" || echo "[WARN] openclaw.json missing"
+  [[ -f "$ws/MEMORY.md" ]] && echo "[OK] MEMORY.md exists" || echo "[WARN] MEMORY.md missing"
+  [[ -d "$ws/memory" ]] && echo "[OK] memory/ exists" || echo "[WARN] memory/ missing"
+  [[ -d "$ws/skills" ]] && echo "[OK] workspace skills/ exists" || echo "[WARN] workspace skills/ missing"
+}
+
+verify_plugin_layout() {
   local base="$OPENCLAW_DIR_DEFAULT"
-  echo "\n== plugin checks =="
-
-  if [[ -f "$base/plugin-manifest.txt" ]]; then
-    echo "[OK] plugin-manifest.txt exists"
-  else
-    echo "[WARN] plugin-manifest.txt missing"
-  fi
-
-  if command -v openclaw >/dev/null 2>&1; then
-    openclaw plugins list || true
-  fi
+  echo
+  echo "== plugin layout checks =="
 
   if [[ -f "$base/openclaw.json" ]]; then
     python3 - <<'PY' "$base/openclaw.json" "$base/extensions"
@@ -483,37 +366,39 @@ if missing:
 else:
     print('[OK] enabled plugin extension directories look complete')
 PY
+  else
+    echo "[WARN] openclaw.json missing; skip plugin layout validation"
   fi
 }
 
 verify_openclaw() {
-  echo "[INFO] Running post-migration checks..."
+  local archive_path="${1:-}"
+
+  echo "[INFO] Running migration verification..."
+  echo "[INFO] Note: plugin/runtime incompatibilities may surface here; treat them separately from archive integrity."
+
+  if [[ -n "$archive_path" ]]; then
+    echo "[INFO] Archive provided; verifying archive first..."
+    openclaw backup verify "$archive_path" || true
+  fi
 
   if command -v openclaw >/dev/null 2>&1; then
-    echo "\n== openclaw status =="
-    openclaw status || true
-
-    echo "\n== channels probe =="
-    openclaw channels status --probe || true
-
-    echo "\n== cron jobs =="
-    openclaw cron list || true
-
-    echo "\n== skills check =="
-    openclaw skills check || true
+    run_check "openclaw version" openclaw --version
+    run_check "openclaw status" openclaw status
+    run_check "config validate" openclaw config validate
+    run_check "channels probe" openclaw channels status --probe
+    run_check "cron jobs" openclaw cron list
+    run_check "skills check" openclaw skills check
+    run_check "plugins list" openclaw plugins list
   else
     echo "[WARN] openclaw command not found; skip runtime checks."
   fi
 
-  verify_plugins
+  verify_plugin_layout
+  verify_workspace
 
-  local ws="$OPENCLAW_DIR_DEFAULT/workspace"
-  echo "\n== workspace checks =="
-  [[ -f "$ws/MEMORY.md" ]] && echo "[OK] MEMORY.md exists" || echo "[WARN] MEMORY.md missing"
-  [[ -d "$ws/memory" ]] && echo "[OK] memory/ exists" || echo "[WARN] memory/ missing"
-  [[ -d "$ws/skills" ]] && echo "[OK] workspace skills/ exists" || echo "[WARN] workspace skills/ missing"
-
-  echo "\n[OK] Verify step completed."
+  echo
+  echo "[OK] Verify step completed. Review WARN/ERROR lines above for follow-up."
 }
 
 backup_verify() {
@@ -525,6 +410,15 @@ backup_verify() {
   fi
   require_bin openclaw
   openclaw backup verify "$archive_path"
+}
+
+export_openclaw() {
+  local archive_path="${1:-$ARCHIVE_DEFAULT}"
+  local include_workspace="${2:-true}"
+  local only_config="${3:-false}"
+  local verify_after="${4:-true}"
+
+  create_official_backup "$archive_path" "$include_workspace" "$only_config" "$verify_after"
 }
 
 main() {
@@ -539,8 +433,6 @@ main() {
   case "$cmd" in
     export)
       local archive=""
-      local include_agents="false"
-      local legacy_export="false"
       local include_workspace="true"
       local only_config="false"
       local verify_after="true"
@@ -552,8 +444,6 @@ main() {
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --include-agents) include_agents="true" ;;
-          --legacy-export) legacy_export="true" ;;
           --no-include-workspace) include_workspace="false" ;;
           --only-config) only_config="true" ;;
           --skip-verify) verify_after="false" ;;
@@ -562,7 +452,7 @@ main() {
         shift
       done
 
-      export_openclaw "$archive" "$include_agents" "$legacy_export" "$include_workspace" "$only_config" "$verify_after"
+      export_openclaw "$archive" "$include_workspace" "$only_config" "$verify_after"
       ;;
 
     import)
@@ -586,11 +476,15 @@ main() {
       ;;
 
     verify)
-      verify_openclaw
+      verify_openclaw "${1:-}"
       ;;
 
     backup-verify)
       backup_verify "${1:-}"
+      ;;
+
+    snapshot-manifest)
+      write_snapshot_manifest "${1:-}"
       ;;
 
     -h|--help|help)
