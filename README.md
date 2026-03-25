@@ -44,6 +44,7 @@
 支持的命令：
 
 - `export`
+- `export-lite`
 - `import`
 - `verify`
 - `backup-verify`
@@ -89,7 +90,62 @@ bash openclaw-migration/migrate-openclaw.sh export ./config-only.tar.gz --only-c
 
 ---
 
-## 2) import
+## 2) export-lite
+
+创建一份**更适合日常迁移 / 留档**的轻量备份包。
+
+和 `export` 不同，`export-lite` 不走官方整包 backup，而是直接对 `~/.openclaw` 做精简打包，默认排除那些通常可再生成、但非常占空间的内容。
+
+### 用法
+
+```bash
+bash openclaw-migration/migrate-openclaw.sh export-lite
+```
+
+或指定输出路径：
+
+```bash
+bash openclaw-migration/migrate-openclaw.sh export-lite ./openclaw-backup-lite.tar.gz
+```
+
+### 默认排除项
+
+- `~/.openclaw/browser`
+- `~/.openclaw/logs`
+- `~/.openclaw/media`
+- `~/.openclaw/workspace/.venv-scrapling`
+- `~/.openclaw/workspace/tmp`
+- `~/.openclaw/workspace/runs`
+- `~/.openclaw/workspace/downloads`
+- `~/.openclaw/workspace/.git`
+- `~/.openclaw/extensions/*/node_modules`
+- `~/.openclaw/extensions/*/.turbo`
+- `~/.openclaw/extensions/*/dist`
+- `~/.openclaw/extensions/*/coverage`
+- `~/.openclaw/extensions/.openclaw-install-backups`
+
+### 适合什么场景
+
+适合：
+
+- 想保留主要配置、workspace 文本内容、扩展源码骨架
+- 想明显减小备份体积
+- 接受迁移后对部分依赖 / 缓存重新生成
+
+不适合：
+
+- 你希望目标机尽量“一拷贝就和原机一模一样”
+- 你不想重新安装扩展依赖
+- 你明确要保留浏览器缓存、媒体、运行时产物
+
+### 和 `export` 的区别
+
+- `export`：更接近**完整状态快照**，适合灾备 / 保守迁移
+- `export-lite`：更接近**精简迁移包**，适合日常备份 / 快速迁移
+
+---
+
+## 3) import
 
 从备份包中恢复 `~/.openclaw`。
 
@@ -126,7 +182,7 @@ bash openclaw-migration/migrate-openclaw.sh import <archive_path> --overwrite
 
 ---
 
-## 3) verify
+## 4) verify
 
 这是 v2 里最有价值的部分之一：它不是只验证“包有没有坏”，而是检查**迁移后的 OpenClaw 能不能正常工作**。
 
@@ -165,7 +221,7 @@ bash openclaw-migration/migrate-openclaw.sh verify ./backup.tar.gz
 
 ---
 
-## 4) backup-verify
+## 5) backup-verify
 
 纯官方包校验。
 
@@ -183,7 +239,7 @@ bash openclaw-migration/migrate-openclaw.sh backup-verify ./backup.tar.gz
 
 ---
 
-## 5) snapshot-manifest
+## 6) snapshot-manifest
 
 生成当前本机 OpenClaw 状态的轻量快照，便于迁移前后比对。
 
@@ -228,8 +284,16 @@ bash openclaw-migration/migrate-openclaw.sh snapshot-manifest ./source-before.tx
 
 ### 2. 导出备份
 
+完整备份：
+
 ```bash
 bash openclaw-migration/migrate-openclaw.sh export ./openclaw-backup.tar.gz
+```
+
+轻量备份：
+
+```bash
+bash openclaw-migration/migrate-openclaw.sh export-lite ./openclaw-backup-lite.tar.gz
 ```
 
 ### 3. 再手动确认一下包可读

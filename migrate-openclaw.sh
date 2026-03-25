@@ -1,5 +1,4 @@
-#!/bin/sh
-[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
+#!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +16,7 @@ Philosophy:
 
 Usage:
   migrate-openclaw.sh export [archive_path] [options]
+  migrate-openclaw.sh export-lite [archive_path]
   migrate-openclaw.sh import <archive_path> [--overwrite]
   migrate-openclaw.sh verify [archive_path]
   migrate-openclaw.sh backup-verify <archive_path>
@@ -24,6 +24,8 @@ Usage:
 
 Commands:
   export            Create backup archive via official `openclaw backup create`.
+  export-lite       Create a smaller tar.gz backup excluding caches, browser data,
+                    virtualenvs, logs, temp files, and bulky extension dependencies.
   import            Restore archive payload into ~/.openclaw.
   verify            Run migration checks; optionally also verify an archive first.
   backup-verify     Run official `openclaw backup verify` on an archive.
@@ -41,6 +43,8 @@ Examples:
   ./migrate-openclaw.sh export
   ./migrate-openclaw.sh export ./backup.tar.gz --skip-verify
   ./migrate-openclaw.sh export ./backup.tar.gz --no-include-workspace
+  ./migrate-openclaw.sh export-lite
+  ./migrate-openclaw.sh export-lite ./backup-lite.tar.gz
   ./migrate-openclaw.sh import ./backup.tar.gz --overwrite
   ./migrate-openclaw.sh verify
   ./migrate-openclaw.sh verify ./backup.tar.gz
@@ -167,6 +171,52 @@ create_official_backup() {
   fi
 
   echo "[OK] Export finished: $archive_path"
+}
+
+create_lite_backup() {
+  require_bin tar
+
+  local archive_path="$1"
+  local source_dir="$OPENCLAW_DIR_DEFAULT"
+  local output_dir
+  output_dir="$(dirname "$archive_path")"
+  mkdir -p "$output_dir"
+
+  if [[ ! -d "$source_dir" ]]; then
+    echo "[ERROR] Source directory not found: $source_dir" >&2
+    exit 1
+  fi
+
+  if [[ -e "$archive_path" ]]; then
+    echo "[ERROR] Target archive already exists: $archive_path" >&2
+    exit 1
+  fi
+
+  local -a excludes=(
+    --exclude='.openclaw/browser'
+    --exclude='.openclaw/logs'
+    --exclude='.openclaw/media'
+    --exclude='.openclaw/workspace/.venv-scrapling'
+    --exclude='.openclaw/workspace/tmp'
+    --exclude='.openclaw/workspace/runs'
+    --exclude='.openclaw/workspace/downloads'
+    --exclude='.openclaw/workspace/.git'
+    --exclude='.openclaw/extensions/*/node_modules'
+    --exclude='.openclaw/extensions/*/.turbo'
+    --exclude='.openclaw/extensions/*/dist'
+    --exclude='.openclaw/extensions/*/coverage'
+    --exclude='.openclaw/extensions/.openclaw-install-backups'
+  )
+
+  echo "[INFO] Creating lite archive from: $source_dir"
+  echo "[INFO] Excluding browser cache, logs, media, virtualenvs, temp dirs, downloads, workspace git, and extension node_modules."
+
+  tar -czf "$archive_path" -C "$(dirname "$source_dir")" "${excludes[@]}" "$(basename "$source_dir")"
+
+  echo "[INFO] Verifying tar readability..."
+  tar -tzf "$archive_path" >/dev/null
+
+  echo "[OK] Lite export finished: $archive_path"
 }
 
 find_import_root() {
@@ -453,6 +503,11 @@ main() {
       done
 
       export_openclaw "$archive" "$include_workspace" "$only_config" "$verify_after"
+      ;;
+
+    export-lite)
+      local archive="${1:-${SCRIPT_DIR}/openclaw-backup-lite-$(date +%F-%H%M%S).tar.gz}"
+      create_lite_backup "$archive"
       ;;
 
     import)
